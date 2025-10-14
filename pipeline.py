@@ -5,14 +5,24 @@ os.chdir('D:/Projects/Kernel_Yield_Prediction_UCU/')
 
 import warnings
 
+import re
 import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+import torch
+import shap
+from scipy.sparse import hstack, csr_matrix
 
-from sklearn.metrics import root_mean_squared_error, mean_squared_error
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.metrics import root_mean_squared_error, silhouette_score
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.impute import KNNImputer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans, DBSCAN
+
+from transformers import AutoTokenizer, AutoModel
+from sentence_transformers import SentenceTransformer
 
 from lightgbm import LGBMRegressor
 from lightgbm.callback import early_stopping
@@ -22,17 +32,27 @@ from lightgbm.callback import early_stopping
 # Disable LightGBM warnings
 # warnings.filterwarnings("ignore", category=UserWarning)
 # warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", message="[LightGBM] [Warning] No further splits with positive gain, best gain: -inf")
+# warnings.filterwarnings("ignore", message="[LightGBM] [Warning] No further splits with positive gain, best gain: -inf")
 
-df_main = pd.read_parquet('data/df_2025.parquet')
+# df_main_old = pd.read_parquet('data/df_2025.parquet')
+df_main = pd.read_parquet('data/df_2025_v2_extended_weather.parquet')
 df_operations = pd.read_parquet('data/operations_2025.parquet')
 
 # initial preparation `main` dataframe
+df_main = df_main[df_main['Culture'].notna()]
+df_main = df_main.loc[:, ~df_main.columns.str.contains('_prev_year')]
 suffix = df_main.columns.str.extract(r'(\d+)$')[0].astype(float)
 selected_cols = df_main.columns[suffix >= 34]
 df_main = df_main.drop(columns=selected_cols)
-df_main = df_main.drop(columns=['Year', 'Culture', 'crop', 'Moisture', 'K'])
+df_main = df_main.drop(columns=['Year', 'Culture', 'Moisture', 'K', 'WeatherGridId', 'crop', 'County', 'Mex', 'Cluster'])
 df_main = df_main[df_main['Area'].notna()]
+col_patterns_to_drop = [
+                        'CumSum_Precipitation',
+                        'CumSum_TempEffective'
+                        ]
+cols_to_drop = [column for column in df_main.columns
+                  if any(substring in column for substring in col_patterns_to_drop)]
+df_main = df_main.drop(columns=cols_to_drop)
 
 # initial preparation `operations` dataframe
 df_operations.columns = ['operation', 'detailed_operation', 'year_of_start', 'date_of_start', 'total', 'field_id']
@@ -86,9 +106,8 @@ df_operations_merged = (
 df_operations_merged_rows = df_operations_merged.groupby('field_id', as_index=False)['detailed_operation'].apply(lambda x: ' '.join(x))
 
 # %%
-# Apply Bag of Words
-import re
 
+# # ============== Bag of Words ==============
 def custom_preprocessor(text):
     # Прибираємо дужки та крапки
     text = re.sub(r"[()]", " ", text)
@@ -105,24 +124,194 @@ def custom_tokenizer(text):
     stopwords = {"на", "та", "із", "з"}  # можна розширити список
     return [t for t in tokens if t not in stopwords]
 
-from sklearn.feature_extraction.text import CountVectorizer
+
 vectorizer = CountVectorizer(
     preprocessor=custom_preprocessor,
     tokenizer=custom_tokenizer
 )
-X = vectorizer.fit_transform(df_operations_merged_rows['detailed_operation'])
+bow_features = vectorizer.fit_transform(df_operations_merged_rows['detailed_operation'])
 
-# %%
-
-bow_features = pd.DataFrame(
-    X.toarray(), 
+X_bow = pd.DataFrame(
+    bow_features.toarray(), 
     columns=vectorizer.get_feature_names_out()
 )
 
-df_operations_prepared = pd.concat([df_operations_merged_rows, bow_features], axis=1)
-df_operations_prepared = df_operations_prepared.drop(columns=['detailed_operation'])
+vectorized_operations = X_bow
 
 # %%
+
+# ============== TF-IDF ==============
+def clean_text(text):
+    text = text.lower().strip()
+    # прибираємо дужки, крапки, коми, лапки, зайві пробіли
+    text = re.sub(r"[()\",.:;!?]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    # замінюємо тире на дефіс, бо іноді буває різниця між "–" і "-"
+    text = text.replace("–", "-").replace("—", "-")
+    return text
+
+def uk_tokenizer(text):
+    # токени: слова, що складаються з літер (укр + англ), цифр і дефісів
+    return re.findall(r"[а-щьюяґєіїА-ЩЬЮЯҐЄІЇ0-9\-]+", text)
+
+tfidf = TfidfVectorizer(
+    preprocessor=clean_text,
+    tokenizer=uk_tokenizer,
+    analyzer="word",
+    ngram_range=(1, 2),          # уніграми + біграми
+    max_features=4000,
+    sublinear_tf=True,
+    min_df=1,
+    max_df=0.95,
+    norm="l2"
+)
+
+tfidf_features = tfidf.fit_transform(df_operations_merged_rows['detailed_operation'])   # sparse матриця
+X_tfidf = pd.DataFrame(
+    tfidf_features.toarray(), 
+    columns=tfidf.get_feature_names_out()
+)
+print("TF-IDF shape:", X_tfidf.shape)
+
+vectorized_operations = X_tfidf
+
+# %%
+
+# ============== Embeddings V1 ==============
+model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# model_name = "Alibaba-NLP/gte-multilingual-base"
+
+# Завантажуємо токенайзер і модель
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
+
+def get_sentence_embedding(text):
+    # Токенізація
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # Беремо середнє по токенах (mean pooling)
+    embeddings = outputs.last_hidden_state.mean(dim=1)
+    return embeddings[0].numpy()
+
+texts = df_operations_merged_rows['detailed_operation'].tolist()
+
+embeddings = np.vstack([get_sentence_embedding(t) for t in texts])
+print(embeddings.shape)
+
+# %%
+
+# ============== Embeddings V2 ==============
+# model_name_or_path="Alibaba-NLP/gte-multilingual-base"
+# model = SentenceTransformer(model_name_or_path, trust_remote_code=True)
+# embeddings = model.encode(texts, normalize_embeddings=True)
+# print(embeddings.shape)
+
+# sim scores
+# scores = model.similarity(embeddings[:1], embeddings[1:])
+
+# %%
+
+# ============== PCA ==============
+# PCA без фіксації n_components
+pca = PCA(random_state=8)
+pca.fit(embeddings)
+
+explained_variance = np.cumsum(pca.explained_variance_ratio_)
+
+# Знаходимо кількість компонент для 95% дисперсії
+n_components_95 = np.argmax(explained_variance >= 0.95) + 1
+print(f"✅ Кількість компонент для 95% дисперсії: {n_components_95}")
+
+# Побудова графіка
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, len(explained_variance) + 1), explained_variance, marker='.')
+plt.axhline(y=0.95, color='r', linestyle='--', label='95% дисперсії')
+plt.axvline(x=n_components_95, color='g', linestyle='--', label=f'{n_components_95} компонент')
+plt.xlabel('Кількість компонент')
+plt.ylabel('Кумулятивна пояснена дисперсія')
+plt.title('Вибір кількості компонент PCA')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Використовуємо PCA зі знайденою кількістю компонент
+pca_final = PCA(n_components=n_components_95, random_state=8)
+emb_pca = pca_final.fit_transform(embeddings)
+X_pca = pd.DataFrame(emb_pca, columns=[f"pca_{i+1}" for i in range(n_components_95)])
+
+vectorized_operations = X_pca
+
+# %%
+
+# ============== KMeans ==============
+# Визначення оптимальної кількості кластерів за допомогою Elbow Method та Silhouette Score
+inertias = []
+silhouette_scores = []
+K_range = range(2, 15)  # перевіримо кластери від 2 до 14
+
+for k in K_range:
+    kmeans = KMeans(n_clusters=k, random_state=8)
+    labels = kmeans.fit_predict(embeddings)
+    inertias.append(kmeans.inertia_)
+    sil_score = silhouette_score(embeddings, labels)
+    silhouette_scores.append(sil_score)
+
+# Графік Elbow
+plt.figure(figsize=(8,5))
+plt.plot(K_range, inertias, 'bo-')
+plt.xlabel('Кількість кластерів (k)')
+plt.ylabel('Inertia')
+plt.title('Elbow Method для KMeans')
+plt.grid(True)
+plt.show()
+
+# Графік Silhouette Score
+plt.figure(figsize=(8,5))
+plt.plot(K_range, silhouette_scores, 'ro-')
+plt.xlabel('Кількість кластерів (k)')
+plt.ylabel('Silhouette Score')
+plt.title('Silhouette Score для різної кількості кластерів')
+plt.grid(True)
+plt.show()
+
+# Знайдемо оптимум за silhouette
+best_k = K_range[np.argmax(silhouette_scores)]
+print(f"✅ Оптимальна кількість кластерів за silhouette score: {best_k}")
+
+# Навчання KMeans з оптимальною кількістю кластерів
+kmeans = KMeans(n_clusters=best_k, random_state=8)
+clusters = kmeans.fit_predict(embeddings)
+X_kmeans = pd.DataFrame(clusters, columns=['operation_cluster'])
+
+vectorized_operations = X_kmeans
+
+# %%
+
+# ============== DBSCAN ==============
+dbscan = DBSCAN(eps=0.5, min_samples=20)
+labels = dbscan.fit_predict(embeddings)
+
+X_dbscan = pd.DataFrame(labels, columns=['operation_dbscan_cluster'])
+
+vectorized_operations = X_dbscan
+
+
+# %%
+
+# Вибір одного з методів векторизації
+vectorized_operations = X_bow
+# vectorized_operations = X_tfidf
+# vectorized_operations = X_pca
+# vectorized_operations = X_kmeans
+# vectorized_operations = X_dbscan
+# vectorized_operations = pd.DataFrame()
+
+# %%
+
+df_operations_prepared = pd.concat([df_operations_merged_rows, vectorized_operations], axis=1)
+df_operations_prepared = df_operations_prepared.drop(columns=['detailed_operation'])
 
 df_main_prepared = (df_main
                     .merge(df_operations_prepared, left_on='Field_id', right_on='field_id')
@@ -134,8 +323,8 @@ X = df_main_prepared.drop(columns=['Yield'])
 y = df_main_prepared['Yield']
 
 # заповнюємо пропуски, окільки є декілька пропусків в `P`
-imputer = KNNImputer(n_neighbors=5).set_output(transform='pandas')
-X = imputer.fit_transform(X)
+# imputer = KNNImputer(n_neighbors=5).set_output(transform='pandas')
+# X = imputer.fit_transform(X)
 
 # %%
 
@@ -171,9 +360,9 @@ def train_lgbm_with_cv(X, y, params, n_splits=5):
         # Модель для середнього значення
         model_mean = LGBMRegressor(objective='regression', **params)
         # Модель для нижньої межі
-        model_lower = LGBMRegressor(objective='quantile', alpha=0.025, **params)
+        model_lower = LGBMRegressor(objective='quantile', alpha=0.05, **params)
         # Модель для верхньої межі
-        model_upper = LGBMRegressor(objective='quantile', alpha=0.975, **params)
+        model_upper = LGBMRegressor(objective='quantile', alpha=0.95, **params)
 
         for model in [model_mean, model_lower, model_upper]:
             if cv_mode:
@@ -181,13 +370,12 @@ def train_lgbm_with_cv(X, y, params, n_splits=5):
                     X_train, y_train,
                     eval_set=[(X_eval, y_eval)],
                     eval_metric="rmse",
-                    callbacks=[early_stopping(stopping_rounds=100, verbose=True)],
+                    callbacks=[early_stopping(stopping_rounds=100, verbose=True)],  # try int in range 20-100
                 )
             else:
                 model.fit(
                     X, y,
                     eval_metric="rmse",
-                    # callbacks=[early_stopping(stopping_rounds=100, verbose=True)],
                 )
         return model_mean, model_lower, model_upper
 
@@ -210,34 +398,27 @@ def train_lgbm_with_cv(X, y, params, n_splits=5):
     mean_rmse_cv = np.mean(scores_mean)
     lower_rmse_cv = np.mean(scores_lower)
     upper_rmse_cv = np.mean(scores_upper)
-    print(f"\nCV RMSE: {mean_rmse_cv:.4f} ± {np.std(scores_mean):.4f}")
+    print(f"\nCV RMSE on Train: {mean_rmse_cv:.4f} ± {np.std(scores_mean):.4f}")
 
     return {
         'models': {'mean': model_mean, 'lower': model_lower, 'upper': model_upper},
         'cv_rmse': {'mean': mean_rmse_cv, 'lower': lower_rmse_cv, 'upper': upper_rmse_cv},
     }
 
-start_week = 20
+start_week = 15
 end_week = 33
 
 results_weekly = {}
-
 for w in range(start_week, end_week+1):
     print(w)
     suffix = df_main.columns.str.extract(r'(\d+)$')[0].astype(float)
     week_cols_to_drop = df_main.columns[suffix > w]
-
     X_trn_prep = X_trn.drop(columns=week_cols_to_drop)
-    
-    results_weekly[w] = train_lgbm_with_cv(X_trn_prep, y_trn, lgbm_params, n_splits=8)
-
-# %%
+    results_weekly[w] = train_lgbm_with_cv(X_trn_prep, y_trn, lgbm_params, n_splits=5)
 
 # %% 
 
 # Візуалізація точності моделей по тижнях
-import matplotlib.pyplot as plt
-
 weeks = results_weekly.keys()
 cv_rmse_list_for_mean = [v['cv_rmse']['mean'] for v in results_weekly.values()]
 cv_rmse_list_for_lower = [v['cv_rmse']['lower'] for v in results_weekly.values()]
@@ -256,11 +437,24 @@ plt.show()
 
 # %%
 
+# Оцінка моделей на валідаційній вибірці
+print("Validation RMSE:")
+for w in results_weekly.keys(): 
+    print(f"Week {w}:")
+    week_cols_to_drop = df_main.columns[df_main.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
+    X_val_prep = X_val.drop(columns=week_cols_to_drop)
+    # print(X_val_prep.columns)
+    
+    for model_type, model in results_weekly[w]['models'].items():
+        y_val_pred = model.predict(X_val_prep)
+        val_rmse = root_mean_squared_error(y_val, y_val_pred)
+        print(f"  {model_type.capitalize()} Model RMSE: {val_rmse:.4f}")
+    print()
 
-# %% Розрахунок SHAP values для моделей кожного тижня
 
-import shap
+# %% 
 
+# Розрахунок SHAP values для моделей кожного тижня
 model_types = [
     'mean', 
     # 'lower', 
@@ -268,7 +462,6 @@ model_types = [
 ]
 
 shap_values_weekly = {}
-
 for w in results_weekly.keys():
     shap_values_weekly[w] = {}
     week_cols_to_drop = df_main.columns[df_main.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
@@ -284,7 +477,6 @@ for w in results_weekly.keys():
         }
 
 # Побудова графіків SHAP важливості ознак для кожного тижня та моделі
-
 for w in shap_values_weekly.keys():
     for model_type in model_types:
         plt.figure(figsize=(10, 6))
