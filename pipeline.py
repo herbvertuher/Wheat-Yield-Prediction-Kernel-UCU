@@ -6,6 +6,7 @@ os.chdir('D:/Projects/Kernel_Yield_Prediction_UCU/')
 import warnings
 
 import re
+import json
 import pandas as pd
 import numpy as np
 import seaborn as sns
@@ -16,7 +17,7 @@ from scipy.sparse import hstack, csr_matrix
 from scipy.cluster.hierarchy import dendrogram, linkage
 from pyproj import Transformer
 
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score, silhouette_score
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score, mean_pinball_loss, silhouette_score
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.impute import KNNImputer
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
@@ -27,6 +28,7 @@ from sklearn.manifold import TSNE
 
 import umap
 import hdbscan
+from hdbscan.validity import validity_index
 # from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
 
@@ -34,10 +36,16 @@ from lightgbm import LGBMRegressor
 from lightgbm.callback import early_stopping
 # from xgboost import XGBRegressor
 
-# GLOBAL_RANDOM_SEED = 8
+# GLOBAL_RANDOM_SEED = 88
 GLOBAL_RANDOM_SEED = np.random.randint(10000)
 np.random.seed(GLOBAL_RANDOM_SEED)
 print('GLOBAL_RANDOM_SEED =', GLOBAL_RANDOM_SEED)
+
+LOWER_QUANTILE = 0.05
+UPPER_QUANTILE = 0.95
+
+START_WEEK = 20
+END_WEEK = 28
 
 use_bow = False
 use_tfidf = False
@@ -168,19 +176,82 @@ print('Embeddings shape:', embeddings.shape)
 
 # %%
 
+def embeddings_objective(trial):
+    # Гіперпараметри UMAP
+    n_neighbors = trial.suggest_int('umap_n_neighbors', 10, 30)
+    min_dist = trial.suggest_float('umap_min_dist', 0.0, 0.25)
+    n_components = trial.suggest_int('umap_n_components', 5, 15)
+    
+    # Гіперпараметри HDBSCAN
+    min_cluster_size = trial.suggest_int('hdbscan_min_cluster_size', 10, 50) 
+    min_samples = trial.suggest_int('hdbscan_min_samples', 5, 15)
+    cluster_selection_method = trial.suggest_categorical('hdbscan_cluster_selection_method', ['eom', 'leaf'])
+    
+    # Застосування UMAP
+    umap_reducer = umap.UMAP(
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        n_components=n_components,
+        metric='cosine',  # Фіксований для семантичних ембедінгів
+        random_state=GLOBAL_RANDOM_SEED
+    )
+    embeddings_reduced = umap_reducer.fit_transform(embeddings)
+    embeddings_reduced = embeddings_reduced.astype(np.float64)  # Щоб уникнути помилки в validity_index
+    
+    # Застосування HDBSCAN
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_method=cluster_selection_method,
+        metric='euclidean',  # Для зменшених даних
+        gen_min_span_tree=True
+    )
+    labels = clusterer.fit_predict(embeddings_reduced)
+   
+    # Обчислення DBCV (validity_index)
+    if len(np.unique(labels)) > 1:  # Потрібно щонайменше 2 кластери
+        score = validity_index(embeddings_reduced, labels, metric='euclidean')
+    else:
+        score = -1  # Погана оцінка, якщо немає кластерів
+    
+    return score  # Optuna максимізує цю функцію (DBCV -> max=1)
+
+params_filename = f'best_umap_hdbscan_params_{selected_embedding_model_name}.json'.replace('/', '_')
+if os.path.isfile(params_filename):
+    with open(params_filename, 'r', encoding='utf-8') as f:
+        embedding_best_params = json.load(f)
+    print(f"Параметри завантажено з {params_filename}")
+else:
+    # Запускаю оптимізацію з Optuna
+    study = optuna.create_study(direction='maximize')
+    study.optimize(embeddings_objective, n_trials=300)  # Максимізуємо DBCV
+
+    # Найкращі параметри
+    embedding_best_params = study.best_params
+    print("Найкращі параметри:", embedding_best_params)
+
+    # Збереження в JSON
+    with open(params_filename, 'w') as f:
+        json.dump(embedding_best_params, f, indent=4)
+    print(f"Параметри збережено в {params_filename}")
+
+# %%
+
+# Зчитування параметрів для UMAP
 umap_params = {
-    "n_neighbors": 30,
-    "n_components": 10,
-    "min_dist": 0.1,
-    "metric": "cosine",
-    "random_state": GLOBAL_RANDOM_SEED
+    'n_neighbors': embedding_best_params['umap_n_neighbors'],
+    'min_dist': embedding_best_params['umap_min_dist'],
+    'n_components': embedding_best_params['umap_n_components'],
+    'metric': 'cosine',  # Фіксований
+    'random_state': GLOBAL_RANDOM_SEED   # Для відтворюваності
 }
 
+# Зчитування параметрів для HDBSCAN
 hdbscan_params = {
-    "min_cluster_size": 30,
-    "min_samples": 5,
-    "metric": "euclidean",
-    "cluster_selection_method": "eom"
+    'min_cluster_size': embedding_best_params['hdbscan_min_cluster_size'],
+    'min_samples': embedding_best_params['hdbscan_min_samples'],
+    'cluster_selection_method': embedding_best_params['hdbscan_cluster_selection_method'],
+    'metric': 'euclidean'  # Фіксований
 }
 
 # Зменшення розмірності з UMAP (для кластеризації)
@@ -218,7 +289,7 @@ plt.show()
 # %%
 
 # Використання t-SNE
-tsne = TSNE(n_components=2, perplexity=30, learning_rate='auto', random_state=42)
+tsne = TSNE(n_components=2, perplexity=50, learning_rate='auto', random_state=GLOBAL_RANDOM_SEED)
 embeddings_2d = tsne.fit_transform(embeddings)
 
 # Візуалізація (додайте labels, якщо є)
@@ -306,6 +377,9 @@ df_main_prepared = df_main_prepared.drop(columns=[
                                                   'Longitude', 'Latitude', 
                                                   'coordinate_x', 'coordinate_y',
                                                   ])
+
+# df_main_prepared['P'] = df_main_prepared['P'].fillna(0)
+# df_main_prepared['K'] = df_main_prepared['K'].fillna(0)
 
 # %%
 
@@ -566,9 +640,9 @@ lgbm_params = {
     "max_depth": 6,
     "min_child_samples": 20,
     "min_child_weight": 1e-2,
-    # "subsample": 0.7,
-    # "subsample_freq": 1,
-    # "colsample_bytree": 0.6,
+    "subsample": 0.7,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.6,
     "reg_alpha": 0.2,
     "reg_lambda": 0.8,
     "random_state": GLOBAL_RANDOM_SEED,
@@ -578,18 +652,18 @@ lgbm_params = {
 def train_lgbm_with_cv(X, y, params, n_splits=5):
     stratify_col = X['Region_cluster']
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=GLOBAL_RANDOM_SEED)
+
     mae_mean = []
-    mae_lower = []
-    mae_upper = []
-    r2_mean = []
     mape_mean = []
-    mape_lower = []
-    mape_upper = []
+    r2_mean = []
+
+    pinball_lower = []
+    pinball_upper = []
 
     def init_and_fit_models(X_train, y_train, cv_mode: bool, X_eval=None, y_eval=None):
         model_mean = LGBMRegressor(objective='regression', **params)
-        model_lower = LGBMRegressor(objective='quantile', alpha=0.05, **params)
-        model_upper = LGBMRegressor(objective='quantile', alpha=0.95, **params)
+        model_lower = LGBMRegressor(objective='quantile', alpha=LOWER_QUANTILE, **params)
+        model_upper = LGBMRegressor(objective='quantile', alpha=UPPER_QUANTILE, **params)
 
         for model in [model_mean, model_lower, model_upper]:
             if cv_mode:
@@ -607,71 +681,72 @@ def train_lgbm_with_cv(X, y, params, n_splits=5):
         return model_mean, model_lower, model_upper
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(X, stratify_col), 1):
+
+        # Split data with CV
         X_train, X_eval = X.iloc[train_idx], X.iloc[val_idx]
         y_train, y_eval = y.iloc[train_idx], y.iloc[val_idx]
 
-        # print(X_train['Region_cluster'].value_counts(normalize=True))
-
+        # Initialize models for fold
         model_mean_cv, model_lower_cv, model_upper_cv = init_and_fit_models(X_train, y_train, cv_mode=True, X_eval=X_eval, y_eval=y_eval)
 
+        # Generate fold predictions
         y_pred_mean = model_mean_cv.predict(X_eval)
         y_pred_lower = model_lower_cv.predict(X_eval)
         y_pred_upper = model_upper_cv.predict(X_eval)
 
+        # CV metrics for `mean` model
         mae_mean.append(mean_absolute_error(y_eval, y_pred_mean))
-        mae_lower.append(mean_absolute_error(y_eval, y_pred_lower))
-        mae_upper.append(mean_absolute_error(y_eval, y_pred_upper))
-
         mape_mean.append(mean_absolute_percentage_error(y_eval, y_pred_mean))
-        mape_lower.append(mean_absolute_percentage_error(y_eval, y_pred_lower))
-        mape_upper.append(mean_absolute_percentage_error(y_eval, y_pred_upper))
-
         r2_mean.append(r2_score(y_eval, y_pred_mean))
 
+        # CV metrics for `lower` model
+        pinball_lower.append(mean_pinball_loss(y_eval, y_pred_lower, alpha=LOWER_QUANTILE))
+
+        # CV metrics for `upper` model
+        pinball_upper.append(mean_pinball_loss(y_eval, y_pred_upper, alpha=UPPER_QUANTILE))
+
+    # Train models for all data without CV
     model_mean, model_lower, model_upper = init_and_fit_models(X, y, cv_mode=False)
 
+    # Summarize metrics for `mean` model
     mean_mae_cv = np.round(np.mean(mae_mean), 4)
-    lower_mae_cv = np.round(np.mean(mae_lower), 4)
-    upper_mae_cv = np.round(np.mean(mae_upper), 4)
-
+    mean_mape_cv = np.round(np.mean(mape_mean), 4)
     mean_r2_cv = np.round(np.mean(r2_mean), 4)
 
-    mean_mape_cv = np.round(np.mean(mape_mean), 4)
-    lower_mape_cv = np.round(np.mean(mape_lower), 4)
-    upper_mape_cv = np.round(np.mean(mape_upper), 4)
+    # Summarize metrics for `lower` model
+    lower_pinball_cv = np.round(np.mean(pinball_lower), 4)
+
+    # Summarize metrics for `upper` model
+    upper_pinball_cv = np.round(np.mean(pinball_upper), 4)
 
     print(f"\nCV MAE on Train: {mean_mae_cv:.4f} ± {np.std(mae_mean):.4f}")
     print(f"CV MAPE on Train: {mean_mape_cv:.4f} ± {np.std(mape_mean):.4f}")
 
     return {
         'models': {'mean': model_mean, 'lower': model_lower, 'upper': model_upper},
-        'cv_mae': {'mean': mean_mae_cv, 'lower': lower_mae_cv, 'upper': upper_mae_cv},
-        'cv_r2': {'mean': mean_r2_cv},
-        'cv_mape': {'mean': mean_mape_cv, 'lower': lower_mape_cv, 'upper': upper_mape_cv},
+        'mean_model_metrics': {'cv_mae': mean_mae_cv, 'cv_mape': mean_mape_cv, 'cv_r2': mean_r2_cv},
+        'lower_model_metrics': {'cv_pinball': lower_pinball_cv},
+        'upper_model_metrics': {'cv_pinball': upper_pinball_cv},
     }
 
-start_week = 20
-end_week = 28
+# %%
 
+# Метрики на крос-валідації
 results_weekly = {}
-for w in range(start_week, end_week+1):
+for w in range(START_WEEK, END_WEEK+1):
     print(w)
     suffix = X_trn_prep.columns.str.extract(r'(\d+)$')[0].astype(float)
     week_cols_to_drop = X_trn_prep.columns[suffix > w]
     X_trn_week = X_trn_prep.drop(columns=week_cols_to_drop)
     results_weekly[w] = train_lgbm_with_cv(X_trn_week, y_trn, lgbm_params, n_splits=5)
 
-# %% 
-
 # Візуалізація точності моделей по тижнях
 weeks = results_weekly.keys()
-cv_mae_list_for_mean = [v['cv_mae']['mean'] for v in results_weekly.values()]
-cv_mae_list_for_lower = [v['cv_mae']['lower'] for v in results_weekly.values()]
-cv_mae_list_for_upper = [v['cv_mae']['upper'] for v in results_weekly.values()]
+cv_mae_list_for_mean = [v['mean_model_metrics']['cv_mae'] for v in results_weekly.values()]
 plt.figure(figsize=(10, 6))
 plt.plot(weeks, cv_mae_list_for_mean, marker='o', c='blue', label='Mean Model')
-plt.plot(weeks, cv_mae_list_for_lower, marker='o', c='green', label='Lower Model')
-plt.plot(weeks, cv_mae_list_for_upper, marker='o', c='red', label='Upper Model')
+# plt.plot(weeks, cv_mae_list_for_lower, marker='o', c='green', label='Lower Model')
+# plt.plot(weeks, cv_mae_list_for_upper, marker='o', c='red', label='Upper Model')
 plt.xlabel('Тиждень')
 plt.ylabel('CV MAE')
 plt.title('Точність моделей по тижнях')
@@ -679,19 +754,15 @@ plt.grid(True)
 plt.legend()
 plt.show()
 
-# %%
-
-# Таблиця з CV метриками
+# Створення таблиці з CV метриками
 data = []
 for w in results_weekly.keys():
     row = {
-        'cv_mae_mean': results_weekly[w]['cv_mae']['mean'],
-        'cv_mape_mean': results_weekly[w]['cv_mape']['mean'],
-        'cv_r2_mean': results_weekly[w]['cv_r2']['mean'],
-        'cv_mae_lower': results_weekly[w]['cv_mae']['lower'],
-        'cv_mape_lower': results_weekly[w]['cv_mape']['lower'],
-        'cv_mae_upper': results_weekly[w]['cv_mae']['upper'],
-        'cv_mape_upper': results_weekly[w]['cv_mape']['upper']
+        'cv_mae_mean': results_weekly[w]['mean_model_metrics']['cv_mae'],
+        'cv_mape_mean': results_weekly[w]['mean_model_metrics']['cv_mape'],
+        'cv_r2_mean': results_weekly[w]['mean_model_metrics']['cv_r2'],
+        'cv_pinball_lower': results_weekly[w]['lower_model_metrics']['cv_pinball'],
+        'cv_pinball_upper': results_weekly[w]['upper_model_metrics']['cv_pinball'],
     }
     data.append(row)
 
@@ -700,8 +771,9 @@ df_cv_metrics
 
 # %%
 
-# Таблиця з метриками на валідаційній вибірці
-val_data = []
+# Створення таблиці з метриками на валідаційній вибірці та збереження прогнозів
+val_metrics = []
+y_val_preds_weekly = {k: {} for k in results_weekly.keys()}
 for w in results_weekly.keys():
     week_cols_to_drop = X_val_prep.columns[X_val_prep.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
     X_val_week = X_val_prep.drop(columns=week_cols_to_drop)
@@ -709,16 +781,43 @@ for w in results_weekly.keys():
     for model_type in ['mean', 'lower', 'upper']:
         model = results_weekly[w]['models'][model_type]
         y_val_pred = model.predict(X_val_week)
-        row[f'val_mae_{model_type}'] = np.round(mean_absolute_error(y_val, y_val_pred), 4)
-        row[f'val_mape_{model_type}'] = np.round(mean_absolute_percentage_error(y_val, y_val_pred), 4)
+        y_val_preds_weekly[w][model_type] = y_val_pred  # Збереження прогнозів для візуалізації
         if model_type == 'mean':
+            row[f'val_mae_{model_type}'] = np.round(mean_absolute_error(y_val, y_val_pred), 4)
+            row[f'val_mape_{model_type}'] = np.round(mean_absolute_percentage_error(y_val, y_val_pred), 4)
             row[f'val_r2_{model_type}'] = np.round(r2_score(y_val, y_val_pred), 4)
-    val_data.append(row)
+        else:
+            current_quantile = LOWER_QUANTILE if model_type == 'lower' else UPPER_QUANTILE
+            row[f'val_pinball_{model_type}'] = np.round(mean_pinball_loss(y_val, y_val_pred, alpha=current_quantile), 4)
+        
+    val_metrics.append(row)
 
-df_val_metrics = pd.DataFrame(val_data, index=results_weekly.keys())
+df_val_metrics = pd.DataFrame(val_metrics, index=results_weekly.keys())
 df_val_metrics
 
 # %% 
+
+for w in y_val_preds_weekly.keys():
+    # print(y_val_preds_weekly[w])
+    df_to_plot = pd.concat([y_val.reset_index(drop=False), pd.DataFrame(y_val_preds_weekly[w])], axis=1).set_index(['field_id'])
+    df_to_plot = df_to_plot.sort_values(['Yield'])
+    df = df_to_plot.copy()
+
+    x = df.index.astype(str)
+    plt.figure(figsize=(24, 6))
+    plt.plot(x, df['Yield'], color='green', marker='*', linestyle='', alpha=0.5, label='Реальне значення')
+    plt.plot(x, df['mean'],  color='blue', marker='*',  linestyle='', alpha=0.5, label='Прогнозоване значення')
+    plt.plot(x, df['lower'], color='purple', marker='', linestyle='--', label='Нижня межа')
+    plt.plot(x, df['upper'], color='brown', marker='', linestyle='--', label='Верхня межа')
+    plt.xlabel('Field ID')
+    plt.ylabel('Yield (тонн/гектар)')
+    plt.xticks(rotation=90)
+    plt.title(f'Візуалізація прогнозів для {w} тижня із довірчими інтервалами 5% та 95%')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.show();
+
+# %%
 
 # Розрахунок SHAP values для моделей кожного тижня
 model_types = [
