@@ -1,8 +1,0 @@
-{
-    "umap_n_neighbors": 26,
-    "umap_min_dist": 0.14981477162444742,
-    "umap_n_components": 15,
-    "hdbscan_min_cluster_size": 12,
-    "hdbscan_min_samples": 7,
-    "hdbscan_cluster_selection_method": "eom"
-}
