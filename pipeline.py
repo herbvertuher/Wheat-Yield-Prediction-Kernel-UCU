@@ -1,19 +1,15 @@
 # %%
 # Load libs and datasets
-import os
-os.chdir('D:/Projects/Kernel_Yield_Prediction_UCU/')
-
-import warnings
-
+from pathlib import Path
 import re
 import json
 import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 import shap
 import optuna
-from scipy.sparse import hstack, csr_matrix
 from scipy.cluster.hierarchy import dendrogram, linkage
 from pyproj import Transformer
 
@@ -29,15 +25,13 @@ from sklearn.manifold import TSNE
 import umap
 import hdbscan
 from hdbscan.validity import validity_index
-# from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
 
 from lightgbm import LGBMRegressor
 from lightgbm.callback import early_stopping
-# from xgboost import XGBRegressor
 
-# GLOBAL_RANDOM_SEED = 88
-GLOBAL_RANDOM_SEED = np.random.randint(10000)
+GLOBAL_RANDOM_SEED = 42
+# GLOBAL_RANDOM_SEED = np.random.randint(10000)
 np.random.seed(GLOBAL_RANDOM_SEED)
 print('GLOBAL_RANDOM_SEED =', GLOBAL_RANDOM_SEED)
 
@@ -53,16 +47,20 @@ use_pca = False
 use_kmeans = False
 use_dbscan = False
 
-# Remove Warnings
-# warnings.filterwarnings('ignore')
-# Disable LightGBM warnings
-# warnings.filterwarnings("ignore", category=UserWarning)
-# warnings.filterwarnings("ignore", category=DeprecationWarning)
-# warnings.filterwarnings("ignore", message="[LightGBM] [Warning] No further splits with positive gain, best gain: -inf")
+root_path = Path(__file__).resolve().parents[0]
 
-# df_main_old = pd.read_parquet('data/df_2025.parquet')
-df_main = pd.read_parquet('data/df_2025_v2_extended_weather.parquet')
-df_operations = pd.read_parquet('data/operations_2025.parquet')
+data_path = root_path / 'data'
+artifacts_path = root_path / 'artifacts'
+plots_path = root_path / 'plots'
+metrics_path = root_path / 'metrics'
+confidence_intervals_path = plots_path / 'confidence_intervals'
+shap_path = plots_path / 'shap'
+
+for directory in [artifacts_path, plots_path, metrics_path, confidence_intervals_path, shap_path]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+df_main = pd.read_parquet(data_path / 'df_2025_v2_extended_weather.parquet')
+df_operations = pd.read_parquet(data_path / 'operations_2025.parquet')
 
 # initial preparation `main` dataframe
 df_main = df_main[df_main['Culture'].notna()]
@@ -73,8 +71,6 @@ df_main = df_main.drop(columns=selected_cols)
 df_main = df_main[df_main['Area'].notna()]
 df_main = df_main.drop(columns=['Year', 'Culture', 'Moisture', 
                                 'WeatherGridId', 
-                                # 'K',
-                                # 'Area',
                                 'crop', 
                                 'County', 
                                 'Mex', 
@@ -84,11 +80,8 @@ df_main = df_main.drop(columns=['Year', 'Culture', 'Moisture',
 col_patterns_to_drop = [
                         'CumSum_Precipitation',
                         'CumSum_TempEffective',
-
                         'WindSpeed',
                         'Sunshine_duration_avg',
-                        # 'EvapoTranspiration',
-                        # 'PrecipitationCumulative_sum',
                         'TempStandardMin',
                         'TempStandardMax',
                         ]
@@ -156,6 +149,27 @@ df_operations_merged_rows = df_operations_merged.groupby('field_id', as_index=Fa
 
 # %%
 
+# Обчислюємо кількість операцій у кожному рядку
+operation_counts = df_operations_merged_rows['detailed_operation'].apply(lambda row: len(row.split('.')))
+# Підраховуємо частоти
+count_series = operation_counts.value_counts().sort_index()
+# Перетворюємо у відсотки
+percentage = (count_series / count_series.sum()) * 100
+
+plt.figure(figsize=(10, 6), dpi=300)
+plt.bar(count_series.index, percentage, color='steelblue', edgecolor='black', alpha=0.85)
+for i, (x, y) in enumerate(zip(count_series.index, percentage)):
+    plt.text(x, y + 0.5, f'{y:.1f}%', ha='center', va='bottom', fontsize=9)
+plt.xlabel('Number of operations', fontsize=12)
+plt.ylabel('Percentage', fontsize=12)
+plt.title('Distribution of the number of operations per field')
+plt.xticks(percentage.index)
+plt.tight_layout()
+plt.savefig(plots_path / 'Distribution_number_of_operations.png', dpi=300)
+plt.show()
+
+# %%
+
 # Перетворення тексту в ембедінги
 embedding_models = [
     'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
@@ -216,24 +230,22 @@ def embeddings_objective(trial):
     
     return score  # Optuna максимізує цю функцію (DBCV -> max=1)
 
-params_filename = f'best_umap_hdbscan_params_{selected_embedding_model_name}.json'.replace('/', '_')
-if os.path.isfile(params_filename):
-    with open(params_filename, 'r', encoding='utf-8') as f:
+best_params_filename = 'optuna_umap_hdbscan_best_params.json'
+if (artifacts_path / best_params_filename).exists():
+    with open(artifacts_path / best_params_filename, 'r', encoding='utf-8') as f:
         embedding_best_params = json.load(f)
-    print(f"Параметри завантажено з {params_filename}")
+    print(f"Параметри завантажено з {best_params_filename}")
 else:
-    # Запускаю оптимізацію з Optuna
+    # Запускаємо оптимізацію з Optuna
     study = optuna.create_study(direction='maximize')
     study.optimize(embeddings_objective, n_trials=300)  # Максимізуємо DBCV
-
-    # Найкращі параметри
     embedding_best_params = study.best_params
     print("Найкращі параметри:", embedding_best_params)
 
     # Збереження в JSON
-    with open(params_filename, 'w') as f:
+    with open(artifacts_path / best_params_filename, 'w') as f:
         json.dump(embedding_best_params, f, indent=4)
-    print(f"Параметри збережено в {params_filename}")
+    print(f"Параметри збережено в {best_params_filename}")
 
 # %%
 
@@ -243,7 +255,7 @@ umap_params = {
     'min_dist': embedding_best_params['umap_min_dist'],
     'n_components': embedding_best_params['umap_n_components'],
     'metric': 'cosine',  # Фіксований
-    'random_state': GLOBAL_RANDOM_SEED   # Для відтворюваності
+    'random_state': GLOBAL_RANDOM_SEED,   # Для відтворюваності
 }
 
 # Зчитування параметрів для HDBSCAN
@@ -251,7 +263,8 @@ hdbscan_params = {
     'min_cluster_size': embedding_best_params['hdbscan_min_cluster_size'],
     'min_samples': embedding_best_params['hdbscan_min_samples'],
     'cluster_selection_method': embedding_best_params['hdbscan_cluster_selection_method'],
-    'metric': 'euclidean'  # Фіксований
+    'metric': 'euclidean',  # Фіксований
+    'prediction_data': True,
 }
 
 # Зменшення розмірності з UMAP (для кластеризації)
@@ -264,19 +277,40 @@ labels = clusterer.fit_predict(embeddings_reduced)
 
 # Кількість кластерів (ігноруючи шум -1)
 n_clusters = len(np.unique(labels)) - (1 if -1 in labels else 0)
-print(f"Знайдено {n_clusters} кластерів. Шум: {np.sum(labels == -1)} точок.")
+print(f"Found {n_clusters} clusters. Noise: {np.sum(labels == -1)} points.")
 
 # Крок 3: Візуалізація (2D UMAP для перегляду)
 umap_2d = umap.UMAP(n_components=2, metric='cosine', n_neighbors=15, min_dist=0.1, random_state=GLOBAL_RANDOM_SEED)
 embeddings_2d = umap_2d.fit_transform(embeddings)
 
-plt.figure(figsize=(10, 8))
-plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], c=labels, cmap='Spectral', alpha=0.7)
-plt.colorbar()
-plt.title('Кластеризація ембедінгів (UMAP + HDBSCAN)')
-plt.xlabel('Компонента 1')
-plt.ylabel('Компонента 2')
-plt.grid(True)
+plt.figure(figsize=(12, 8))
+unique_labels = np.unique(labels)
+n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)  # Кількість кластерів без шуму
+colors = sns.color_palette('husl', n_colors=len(unique_labels))
+
+for i, lab in enumerate(unique_labels):
+    mask = labels == lab
+    if not np.any(mask):  # Перевірка на порожній кластер
+        continue
+    label_name = 'Noise' if lab == -1 else f'Cluster {lab}'
+    # Виділяємо шум: менший розмір, сірий колір, менша прозорість
+    size = 20 if lab == -1 else 40
+    color = 'gray' if lab == -1 else colors[i]
+    alpha = 0.5 if lab == -1 else 1.0
+    plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1], s=size, alpha=alpha, 
+                color=color, label=label_name, edgecolor='k', linewidth=0.5)  # Обводка для видимості
+
+# Легенда замість colorbar: краща для дискретних міток
+plt.legend(title='Cluster label:', bbox_to_anchor=(1.01, 1), loc='upper left', 
+           borderaxespad=0, shadow=True, fontsize='medium')
+
+plt.title('Clustering embeddings (UMAP + HDBSCAN)', fontsize=16)
+plt.xlabel('Component 1', fontsize=12)
+plt.ylabel('Component 2', fontsize=12)
+
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.savefig(plots_path / 'umap_hdbscan_2D_visualization.png', dpi=300)
 plt.show()
 
 # # Опціонально: Аналіз кластерів (вивести приклади текстів)
@@ -292,27 +326,43 @@ plt.show()
 tsne = TSNE(n_components=2, perplexity=50, learning_rate='auto', random_state=GLOBAL_RANDOM_SEED)
 embeddings_2d = tsne.fit_transform(embeddings)
 
-# Візуалізація (додайте labels, якщо є)
-plt.figure(figsize=(10, 8))
+plt.figure(figsize=(12, 8))
 unique_labels = np.unique(labels)
-for lab in unique_labels:
-    mask = labels == lab
-    label_name = 'noise' if lab == -1 else f'cluster {lab}'
-    plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1], s=40, alpha=0.7, label=label_name)
-plt.legend(title='Labels', bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.title('Візуалізація ембедінгів за допомогою t-SNE')
-plt.xlabel('Компонента 1')
-plt.ylabel('Компонента 2')
-plt.grid(True)
-plt.show()
+n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)  # Кількість кластерів без шуму
+colors = sns.color_palette('husl', n_colors=len(unique_labels))
 
+cmap = ListedColormap(colors)
+
+for i, lab in enumerate(unique_labels):
+    mask = (labels == lab)
+    if not np.any(mask):  # Перевірка на порожній кластер (краща практика)
+        continue
+    label_name = 'Noise' if lab == -1 else f'Cluster {lab}'
+    # Для шуму використовуємо менший розмір і сірий колір (якщо lab == -1)
+    size = 20 if lab == -1 else 40
+    color = 'gray' if lab == -1 else cmap(i)
+    alpha = 0.5 if lab == -1 else 1.0  # Менша прозорість для шуму
+    plt.scatter(embeddings_2d[mask, 0], embeddings_2d[mask, 1], s=size, alpha=alpha, 
+                color=color, label=label_name, edgecolor='k', linewidth=0.5)  # Додаємо обводку для кращої видимості
+
+plt.legend(title='Cluster label:', bbox_to_anchor=(1.01, 1), loc='upper left', 
+           borderaxespad=0, shadow=True, fontsize='medium')
+
+plt.title('Visualization of embeddings using t-SNE', fontsize=16)
+plt.xlabel('Component 1', fontsize=12)
+plt.ylabel('Component 2', fontsize=12)
+
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.savefig(plots_path / 't-SNE_visualization.png', dpi=300)
+plt.show()
 
 df_embeddings_labels = pd.DataFrame(data=labels,
                                     index=df_operations_merged_rows['field_id'],
-                                    columns=['HDBSCAN_cluster_label']
+                                    columns=['HDBSCAN_operation_cluster']
                                     ).reset_index(drop=False)
-df_embeddings_labels['HDBSCAN_cluster_label'] = \
-        df_embeddings_labels['HDBSCAN_cluster_label'].astype('category')
+df_embeddings_labels['HDBSCAN_operation_cluster'] = \
+        df_embeddings_labels['HDBSCAN_operation_cluster'].astype('category')
 
 # %%
 
@@ -341,15 +391,16 @@ coordinates_scaled = coord_scaler.fit_transform(df_main_prepared[['coordinate_x'
 # Це найпопулярніший та найчастіше рекомендований метод.
 linked = linkage(coordinates_scaled, method=linkage_method)
 
-plt.figure(figsize=(12, 7))
+plt.figure(figsize=(14, 7))
 dendrogram(linked,
             orientation='top',
             labels=None, # можна передати мітки для кожної точки
             distance_sort='descending',
             show_leaf_counts=True)
-plt.title('Ієрархічна кластеризація (Дендрограма)')
-plt.xlabel('Індекс точки даних')
-plt.ylabel('Відстань (Евклідова)')
+plt.title('Hierarchical Clustering (Dendrogram)')
+plt.xticks([])
+plt.ylabel('Euclidean Distance')
+plt.savefig(plots_path / 'Dendrogram_visualization.png', dpi=300)
 plt.show()
 
 agg_cluster = AgglomerativeClustering(n_clusters=selected_n_clusters, linkage=linkage_method, metric='euclidean')  # ward
@@ -357,10 +408,11 @@ region_labels = agg_cluster.fit_predict(coordinates_scaled)
 
 plt.figure(figsize=(10, 7))
 plt.scatter(coordinates_scaled[:, 0], coordinates_scaled[:, 1], c=region_labels, cmap='viridis', s=50)
-plt.title('Результати агломеративної кластеризації (n_clusters=4)')
-plt.xlabel('coordinate_x (масштабована)')
-plt.ylabel('coordinate_y (масштабована)')
+plt.title('Agglomerative Clustering Results (n_clusters=4)')
+plt.xlabel('Scaled coordinate_x')
+plt.ylabel('Scaled coordinate_y')
 plt.grid(True)
+plt.savefig(plots_path / 'AgglomerativeClustering_results_visualization.png', dpi=300)
 plt.show()
 
 # Альтернативне використання KMeans для кластеризації
@@ -731,7 +783,7 @@ def train_lgbm_with_cv(X, y, params, n_splits=5):
 
 # %%
 
-# Метрики на крос-валідації
+# Основний цикл з навчанням моделей за збереженням CV метрик
 results_weekly = {}
 for w in range(START_WEEK, END_WEEK+1):
     print(w)
@@ -740,19 +792,7 @@ for w in range(START_WEEK, END_WEEK+1):
     X_trn_week = X_trn_prep.drop(columns=week_cols_to_drop)
     results_weekly[w] = train_lgbm_with_cv(X_trn_week, y_trn, lgbm_params, n_splits=5)
 
-# Візуалізація точності моделей по тижнях
-weeks = results_weekly.keys()
-cv_mae_list_for_mean = [v['mean_model_metrics']['cv_mae'] for v in results_weekly.values()]
-plt.figure(figsize=(10, 6))
-plt.plot(weeks, cv_mae_list_for_mean, marker='o', c='blue', label='Mean Model')
-# plt.plot(weeks, cv_mae_list_for_lower, marker='o', c='green', label='Lower Model')
-# plt.plot(weeks, cv_mae_list_for_upper, marker='o', c='red', label='Upper Model')
-plt.xlabel('Тиждень')
-plt.ylabel('CV MAE')
-plt.title('Точність моделей по тижнях')
-plt.grid(True)
-plt.legend()
-plt.show()
+# %%
 
 # Створення таблиці з CV метриками
 data = []
@@ -767,7 +807,73 @@ for w in results_weekly.keys():
     data.append(row)
 
 df_cv_metrics = pd.DataFrame(data, index=results_weekly.keys())
+df_cv_metrics.to_pickle(metrics_path / 'df_cv_metrics.pkl')
 df_cv_metrics
+
+# %%
+
+weeks = results_weekly.keys()
+
+
+# Візуалізація CV метрик моделі `mean` по тижнях
+fig, ax1 = plt.subplots(figsize=(10, 6))
+
+# Перша вісь (MAE)
+ax1.plot(weeks, df_cv_metrics['cv_mae_mean'], marker='o', color='blue', label='MAE `mean`')
+ax1.set_xlabel('Week')
+ax1.set_ylabel('CV MAE', color='blue')
+ax1.tick_params(axis='y', labelcolor='blue')
+ax1.set_yticks(np.arange(0.5, 0.8, 0.05))
+ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+
+# Друга вісь (MAPE)
+ax2 = ax1.twinx()
+ax2.plot(weeks, df_cv_metrics['cv_mape_mean'], marker='s', color='purple', label='MAPE `mean`')
+ax2.set_ylabel('CV MAPE', color='purple')
+ax2.set_yticks(np.arange(0.08, 0.14, 0.01))
+ax2.tick_params(axis='y', labelcolor='purple')
+
+plt.title('Accuracy of the `mean` model by week')
+lines_1, labels_1 = ax1.get_legend_handles_labels()
+lines_2, labels_2 = ax2.get_legend_handles_labels()
+ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
+
+plt.tight_layout()
+plt.savefig(plots_path / f'Model_Mean_accuracy_CV.png', dpi=300)
+plt.show()
+
+# %%
+
+# Візуалізація CV метрик моделей `lower` та `upper` по тижнях
+fig, ax1 = plt.subplots(figsize=(10, 6))
+
+# Перша вісь (Pinball Lower)
+ax1.plot(weeks, df_cv_metrics['cv_pinball_lower'], marker='o', color='blue', label='Pinball `lower`')
+ax1.set_xlabel('Week')
+ax1.set_ylabel('CV Pinball Loss', color='blue')
+ax1.tick_params(axis='y', labelcolor='blue')
+ax1.set_yticks(np.arange(0.08, 0.14, 0.01))
+ax1.grid(True, which='both', linestyle='--', alpha=0.5)
+
+# Друга вісь (Pinball Upper)
+ax2 = ax1.twinx()
+ax2.plot(weeks, df_cv_metrics['cv_pinball_upper'], marker='s', color='purple', label='Pinball `upper`')
+ax2.set_ylabel('CV Pinball Loss', color='purple')
+ax2.set_yticks(np.arange(0.08, 0.14, 0.01))
+ax2.tick_params(axis='y', labelcolor='purple')
+
+# Заголовок і легенда
+plt.title('Accuracy of the `lower` and `upper` models by week')
+# Для обох осей одночасно
+lines_1, labels_1 = ax1.get_legend_handles_labels()
+lines_2, labels_2 = ax2.get_legend_handles_labels()
+ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
+
+# Збереження та показ
+plt.tight_layout()
+plt.savefig(plots_path / f'Models_Lower_and_Upper_accuracy_CV.png', dpi=300)
+plt.show()
+
 
 # %%
 
@@ -793,65 +899,69 @@ for w in results_weekly.keys():
     val_metrics.append(row)
 
 df_val_metrics = pd.DataFrame(val_metrics, index=results_weekly.keys())
+df_val_metrics.to_pickle(metrics_path / 'df_val_metrics.pkl')
 df_val_metrics
 
 # %% 
 
 for w in y_val_preds_weekly.keys():
-    # print(y_val_preds_weekly[w])
     df_to_plot = pd.concat([y_val.reset_index(drop=False), pd.DataFrame(y_val_preds_weekly[w])], axis=1).set_index(['field_id'])
     df_to_plot = df_to_plot.sort_values(['Yield'])
     df = df_to_plot.copy()
 
     x = df.index.astype(str)
-    plt.figure(figsize=(24, 6))
-    plt.plot(x, df['Yield'], color='green', marker='*', linestyle='', alpha=0.5, label='Реальне значення')
-    plt.plot(x, df['mean'],  color='blue', marker='*',  linestyle='', alpha=0.5, label='Прогнозоване значення')
-    plt.plot(x, df['lower'], color='purple', marker='', linestyle='--', label='Нижня межа')
-    plt.plot(x, df['upper'], color='brown', marker='', linestyle='--', label='Верхня межа')
+    plt.figure(figsize=(20, 6), dpi=300)
+    plt.plot(x, df['Yield'], color='green', marker='*', linestyle='', alpha=0.5, label='Actual value')
+    plt.plot(x, df['mean'],  color='blue', marker='*',  linestyle='', alpha=0.5, label='Predicted value')
+    plt.plot(x, df['lower'], color='purple', marker='', linestyle='--', label='Lower bound')
+    plt.plot(x, df['upper'], color='brown', marker='', linestyle='--', label='Upper bound')
     plt.xlabel('Field ID')
-    plt.ylabel('Yield (тонн/гектар)')
+    plt.ylabel('Yield (t/ha)')
     plt.xticks(rotation=90)
-    plt.title(f'Візуалізація прогнозів для {w} тижня із довірчими інтервалами 5% та 95%')
+    plt.title(f'Visualization of forecasts for {w} weeks with confidence intervals of 5% and 95%')
     plt.legend()
     plt.grid(alpha=0.3)
-    plt.show();
+    plt.savefig(confidence_intervals_path / f'week_{w}.png', dpi=300)
+    plt.show()
 
 # %%
 
 # Розрахунок SHAP values для моделей кожного тижня
 model_types = [
     'mean', 
-    # 'lower', 
-    # 'upper'
+    'lower', 
+    'upper'
 ]
+model_to_show = 'mean'
 
-shap_values_weekly = {}
+# Побудова графіків SHAP важливості ознак для кожного тижня та моделі
 for w in results_weekly.keys():
-    shap_values_weekly[w] = {}
     week_cols_to_drop = X_val_prep.columns[X_val_prep.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
     X_val_week = X_val_prep.drop(columns=week_cols_to_drop)
-    
     for model_type in model_types:
         model = results_weekly[w]['models'][model_type]
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_val_week)
-        shap_values_weekly[w][model_type] = {
-            'shap_values': shap_values,
-            'X_val_week': X_val_week
-        }
-
-# Побудова графіків SHAP важливості ознак для кожного тижня та моделі
-for w in shap_values_weekly.keys():
-    for model_type in model_types:
         plt.figure(figsize=(10, 6))
-        shap.summary_plot(
-            shap_values_weekly[w][model_type]['shap_values'],
-            shap_values_weekly[w][model_type]['X_val_week'],
-            show=False
-        )
-        plt.title(f'SHAP важливість ознак: тиждень {w}, модель {model_type}')
+        shap.summary_plot(shap_values, X_val_week, show=False)
+        plt.title(f'SHAP  |  Week: `{w}`  |  Model: `{model_type.capitalize()}`')
         plt.tight_layout()
-        plt.show();
+        plt.savefig(shap_path / f'{model_type}_week_{w}.png', dpi=300)
+        if model_type == model_to_show:
+            plt.show()
+        else:
+            plt.close()
+
+# %%
+
+# Save train_coinfig.json
+train_coinfig = {
+    'random_seed': GLOBAL_RANDOM_SEED,
+    'embedding_model_name': selected_embedding_model_name,
+    'features': X.columns.to_list(),
+    'pred_weeks_range': list(range(START_WEEK, END_WEEK+1))
+}
+with open(artifacts_path / 'train_config.json', 'w') as f:
+    json.dump(train_coinfig, f, indent=4)
 
 # %%
