@@ -13,13 +13,10 @@ import optuna
 from scipy.cluster.hierarchy import dendrogram, linkage
 from pyproj import Transformer
 
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score, mean_pinball_loss, silhouette_score
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score, mean_pinball_loss
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.impute import KNNImputer
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.manifold import TSNE
 
 import umap
@@ -40,12 +37,6 @@ UPPER_QUANTILE = 0.95
 
 START_WEEK = 20
 END_WEEK = 28
-
-use_bow = False
-use_tfidf = False
-use_pca = False
-use_kmeans = False
-use_dbscan = False
 
 root_path = Path(__file__).resolve().parents[0]
 
@@ -430,255 +421,19 @@ df_main_prepared = df_main_prepared.drop(columns=[
                                                   'coordinate_x', 'coordinate_y',
                                                   ])
 
-# df_main_prepared['P'] = df_main_prepared['P'].fillna(0)
-# df_main_prepared['K'] = df_main_prepared['K'].fillna(0)
-
 # %%
 
 X = df_main_prepared.drop(columns=['Yield'])
 y = df_main_prepared['Yield']
 
-# заповнюємо пропуски, окільки є декілька пропусків в `P`
-# /// Вже не актуально. Заповнення не потрібне 
-# imputer = KNNImputer(n_neighbors=5).set_output(transform='pandas')
-# X = imputer.fit_transform(X)
-
 # %%
 
 X_trn, X_val, y_trn, y_val = train_test_split(X, y, test_size=0.15, stratify=X['Region_cluster'], random_state=GLOBAL_RANDOM_SEED)
 
-# Для роботи старого коду з PCA та KMeans
-trn_embeddings = df_embeddings.loc[X_trn.index, :]
-val_embeddings = df_embeddings.loc[X_val.index, :]
-
 # %%
 
-if use_bow:
-    # ============== Bag of Words ==============
-    def custom_preprocessor(text):
-        # Прибираємо дужки та крапки
-        text = re.sub(r"[()]", " ", text)
-        return text
-
-    def custom_tokenizer(text):
-        tokens = re.findall(
-            r"\d+-\d+\s*\w+"             # 5-8 см
-            r"|\d+-[а-яА-ЯїЇєЄіІґҐ]+"    # 1-ша
-            r"|[а-яА-ЯїЇєЄіІґҐ]/[а-яА-ЯїЇєЄіІґҐ]+"  # б/трави
-            r"|[а-яА-ЯїЇєЄіІґҐ]+",       # звичайні слова
-            text.lower()
-        )
-        stopwords = {"на", "та", "із", "з"}  # можна розширити список
-        return [t for t in tokens if t not in stopwords]
-
-    vectorizer = CountVectorizer(
-        preprocessor=custom_preprocessor,
-        tokenizer=custom_tokenizer
-    )
-
-    X_trn_bow = vectorizer.fit_transform(X_trn[operation_column])
-    X_val_bow = vectorizer.transform(X_val[operation_column])
-
-    X_trn_bow_df = pd.DataFrame(X_trn_bow.toarray(), 
-                                columns=vectorizer.get_feature_names_out(), 
-                                index=X_trn.index)
-    X_val_bow_df = pd.DataFrame(X_val_bow.toarray(), 
-                                columns=vectorizer.get_feature_names_out(), 
-                                index=X_val.index)
-
-    print("BoW shape:", X_trn_bow_df.shape)
-
-# %%
-
-if use_tfidf:
-    # ============== TF-IDF ==============
-    def clean_text(text):
-        text = text.lower().strip()
-        # прибираємо дужки, крапки, коми, лапки, зайві пробіли
-        text = re.sub(r"[()\",.:;!?]", " ", text)
-        text = re.sub(r"\s+", " ", text)
-        # замінюємо тире на дефіс, бо іноді буває різниця між "–" і "-"
-        text = text.replace("–", "-").replace("—", "-")
-        return text
-
-    def uk_tokenizer(text):
-        # токени: слова, що складаються з літер (укр + англ), цифр і дефісів
-        return re.findall(r"[а-щьюяґєіїА-ЩЬЮЯҐЄІЇ0-9\-]+", text)
-
-    tfidf = TfidfVectorizer(
-        preprocessor=clean_text,
-        tokenizer=uk_tokenizer,
-        analyzer="word",
-        ngram_range=(1, 3),          # додаємо тріграми для кращого контексту
-        max_features=1000,           # більше ознак для багатших представлень
-        sublinear_tf=True,
-        min_df=2,                    # ігноруємо дуже рідкісні слова
-        max_df=0.90,                 # ігноруємо дуже часті слова
-        norm="l2"
-    )
-
-    X_trn_tfidf = tfidf.fit_transform(X_trn[operation_column])
-    X_val_tfidf = tfidf.transform(X_val[operation_column])
-
-    X_trn_tfidf_df = pd.DataFrame(X_trn_tfidf.toarray(), 
-                                columns=tfidf.get_feature_names_out(), 
-                                index=X_trn.index)
-    X_val_tfidf_df = pd.DataFrame(X_val_tfidf.toarray(), 
-                                columns=tfidf.get_feature_names_out(), 
-                                index=X_val.index)
-
-    print("TF-IDF shape:", X_trn_tfidf_df.shape)
-
-# %%
-
-if use_pca:
-    # ============== PCA ==============
-    # PCA без фіксації n_components
-    pca = PCA(random_state=GLOBAL_RANDOM_SEED)
-    pca.fit(trn_embeddings)
-
-    explained_variance = np.cumsum(pca.explained_variance_ratio_)
-
-    # Знаходимо кількість компонент для 95% дисперсії
-    n_components_95 = np.argmax(explained_variance >= 0.95) + 1
-    print(f"✅ Кількість компонент для 95% дисперсії: {n_components_95}")
-
-    # Побудова графіка
-    plt.figure(figsize=(8, 5))
-    plt.plot(range(1, len(explained_variance) + 1), explained_variance, marker='.')
-    plt.axhline(y=0.95, color='r', linestyle='--', label='95% дисперсії')
-    plt.axvline(x=n_components_95, color='g', linestyle='--', label=f'{n_components_95} компонент')
-    plt.xlabel('Кількість компонент')
-    plt.ylabel('Кумулятивна пояснена дисперсія')
-    plt.title('Вибір кількості компонент PCA')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-    # Використовуємо PCA зі знайденою кількістю компонент
-    pca_final = PCA(n_components=n_components_95, random_state=GLOBAL_RANDOM_SEED)
-
-    X_trn_pca = pca_final.fit_transform(trn_embeddings)
-    X_val_pca = pca_final.transform(val_embeddings)
-
-    X_trn_pca_df = pd.DataFrame(X_trn_pca, 
-                                columns=[f"pca_{i+1}" for i in range(n_components_95)], 
-                                index=X_trn.index)
-    X_val_pca_df = pd.DataFrame(X_val_pca, 
-                                columns=[f"pca_{i+1}" for i in range(n_components_95)], 
-                                index=X_val.index)
-
-    print("PCA shape:", X_trn_pca_df.shape)
-
-# %%
-
-if use_kmeans:
-    # ============== KMeans ==============
-    # Визначення оптимальної кількості кластерів за допомогою Elbow Method та Silhouette Score
-    inertias = []
-    silhouette_scores = []
-    K_range = range(2, 15)  # перевіримо кластери від 2 до 14
-
-    for k in K_range:
-        kmeans = KMeans(n_clusters=k, random_state=GLOBAL_RANDOM_SEED)
-        labels = kmeans.fit_predict(trn_embeddings)
-        inertias.append(kmeans.inertia_)
-        sil_score = silhouette_score(trn_embeddings, labels)
-        silhouette_scores.append(sil_score)
-
-    # Графік Elbow
-    plt.figure(figsize=(8,5))
-    plt.plot(K_range, inertias, 'bo-')
-    plt.xlabel('Кількість кластерів (k)')
-    plt.ylabel('Inertia')
-    plt.title('Elbow Method для KMeans')
-    plt.grid(True)
-    plt.show()
-
-    # Графік Silhouette Score
-    plt.figure(figsize=(8,5))
-    plt.plot(K_range, silhouette_scores, 'ro-')
-    plt.xlabel('Кількість кластерів (k)')
-    plt.ylabel('Silhouette Score')
-    plt.title('Silhouette Score для різної кількості кластерів')
-    plt.grid(True)
-    plt.show()
-
-    # Знайдемо оптимум за silhouette
-    best_k = K_range[np.argmax(silhouette_scores)]
-    print(f"Оптимальна кількість кластерів за silhouette score: {best_k}")
-
-    selected_k = 8
-    # Навчання KMeans з оптимальною кількістю кластерів
-    # kmeans_final = KMeans(n_clusters=selected_k, random_state=GLOBAL_RANDOM_SEED)
-    kmeans_final = KMeans(n_clusters=best_k, random_state=GLOBAL_RANDOM_SEED)
-
-    X_trn_kmeans = kmeans_final.fit_predict(trn_embeddings)
-    X_val_kmeans = kmeans_final.predict(val_embeddings)
-
-    X_trn_kmeans_df = pd.DataFrame(X_trn_kmeans, 
-                                columns=['KMeans_operation_cluster'], 
-                                index=X_trn.index,
-                                )#.astype('category')
-    X_val_kmeans_df = pd.DataFrame(X_val_kmeans, 
-                                columns=['KMeans_operation_cluster'], 
-                                index=X_val.index,
-                                )#.astype('category')
-
-    print("KMeans shape:", X_trn_kmeans_df.shape)
-
-# %%
-
-if use_dbscan:
-    # ============== DBSCAN ==============
-    dbscan = DBSCAN(eps=0.5, min_samples=20)
-    X_trn_dbscan = dbscan.fit_predict(trn_embeddings)
-    X_val_dbscan = dbscan.predict(val_embeddings)
-
-    X_trn_dbscan_df = pd.DataFrame(X_trn_dbscan, columns=['DBSCAN_operation_cluster'], index=X_trn.index)
-    X_val_dbscan_df = pd.DataFrame(X_val_dbscan, columns=['DBSCAN_operation_cluster'], index=X_val.index)
-
-    print("DBSCAN shape:", X_trn_dbscan_df.shape)
-
-# %%
-
-# Вибір одного з методів векторизації
-operation_processing_method = [
-    # 'bow',
-    # 'tfidf',
-    # 'pca',
-    # 'kmeans',
-    # 'dbscan'
-    None,
-][0]
-
-if operation_processing_method == 'bow':
-    X_trn_vectorized_operations = X_trn_bow_df
-    X_val_vectorized_operations = X_val_bow_df
-elif operation_processing_method == 'tfidf':
-    X_trn_vectorized_operations = X_trn_tfidf_df
-    X_val_vectorized_operations = X_val_tfidf_df
-elif operation_processing_method == 'pca':
-    X_trn_vectorized_operations = X_trn_pca_df
-    X_val_vectorized_operations = X_val_pca_df
-elif operation_processing_method == 'kmeans':
-    X_trn_vectorized_operations = X_trn_kmeans_df
-    X_val_vectorized_operations = X_val_kmeans_df
-# elif operation_processing_method == 'dbscan':
-#     X_trn_vectorized_operations = X_trn_dbscan_df
-#     X_val_vectorized_operations = X_val_dbscan_df
-else:
-    X_trn_vectorized_operations = pd.DataFrame(index=X_trn.index)
-    X_val_vectorized_operations = pd.DataFrame(index=X_val.index)
-
-if (use_bow | use_tfidf | use_pca | use_kmeans | use_dbscan):
-    # Об'єднуємо з основними ознаками
-    X_trn_prep = pd.concat([X_trn.drop(columns=[operation_column]), X_trn_vectorized_operations], axis=1)
-    X_val_prep = pd.concat([X_val.drop(columns=[operation_column]), X_val_vectorized_operations], axis=1)
-else:
-    # Для нової версії коду
-    X_trn_prep = X_trn.copy()
-    X_val_prep = X_val.copy()
+X_trn_prep = X_trn.copy()
+X_val_prep = X_val.copy()
 
 print("Final shape:", X_trn_prep.shape)
 
