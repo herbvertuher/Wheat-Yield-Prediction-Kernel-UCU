@@ -131,8 +131,7 @@
         "N",
         "P",
         "K",
-        "HDBSCAN_operation_cluster",
-        "Region_cluster"
+        "HDBSCAN_operation_cluster"
     ],
     "pred_weeks_range": [
         20,

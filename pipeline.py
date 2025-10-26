@@ -547,7 +547,8 @@ for w in range(START_WEEK, END_WEEK+1):
     suffix = X_trn_prep.columns.str.extract(r'(\d+)$')[0].astype(float)
     week_cols_to_drop = X_trn_prep.columns[suffix > w]
     X_trn_week = X_trn_prep.drop(columns=week_cols_to_drop)
-    results_weekly[w] = train_lgbm_with_cv(X_trn_week, y_trn, 'Region_cluster', lgbm_params, n_splits=5)
+    stratify_col_name = 'Region_cluster'
+    results_weekly[w] = train_lgbm_with_cv(X_trn_week, y_trn, stratify_col_name, lgbm_params, n_splits=5)
 
 # %%
 
@@ -717,7 +718,7 @@ for w in results_weekly.keys():
 train_coinfig = {
     'random_seed': GLOBAL_RANDOM_SEED,
     'embedding_model_name': selected_embedding_model_name,
-    'features': X.columns.to_list(),
+    'features': X.drop(columns=[stratify_col_name]).columns.to_list(),
     'pred_weeks_range': list(range(START_WEEK, END_WEEK+1))
 }
 with open(artifacts_path / 'train_config.json', 'w') as f:
