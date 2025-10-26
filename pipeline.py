@@ -456,8 +456,10 @@ lgbm_params = {
     "n_jobs": -1
 }
 
-def train_lgbm_with_cv(X, y, params, n_splits=5):
-    stratify_col = X['Region_cluster']
+def train_lgbm_with_cv(X, y, stratify_col_name, params, n_splits=5):
+    stratify_col_data = X[stratify_col_name]
+    X = X.drop(columns=[stratify_col_name])
+
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=GLOBAL_RANDOM_SEED)
 
     mae_mean = []
@@ -487,7 +489,7 @@ def train_lgbm_with_cv(X, y, params, n_splits=5):
                 )
         return model_mean, model_lower, model_upper
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, stratify_col), 1):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, stratify_col_data), 1):
 
         # Split data with CV
         X_train, X_eval = X.iloc[train_idx], X.iloc[val_idx]
@@ -545,7 +547,7 @@ for w in range(START_WEEK, END_WEEK+1):
     suffix = X_trn_prep.columns.str.extract(r'(\d+)$')[0].astype(float)
     week_cols_to_drop = X_trn_prep.columns[suffix > w]
     X_trn_week = X_trn_prep.drop(columns=week_cols_to_drop)
-    results_weekly[w] = train_lgbm_with_cv(X_trn_week, y_trn, lgbm_params, n_splits=5)
+    results_weekly[w] = train_lgbm_with_cv(X_trn_week, y_trn, 'Region_cluster', lgbm_params, n_splits=5)
 
 # %%
 
@@ -638,6 +640,7 @@ y_val_preds_weekly = {k: {} for k in results_weekly.keys()}
 for w in results_weekly.keys():
     week_cols_to_drop = X_val_prep.columns[X_val_prep.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
     X_val_week = X_val_prep.drop(columns=week_cols_to_drop)
+    X_val_week = X_val_week.drop(columns=['Region_cluster'])
     row = {}
     for model_type in ['mean', 'lower', 'upper']:
         model = results_weekly[w]['models'][model_type]
@@ -693,6 +696,7 @@ model_to_show = 'mean'
 for w in results_weekly.keys():
     week_cols_to_drop = X_val_prep.columns[X_val_prep.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
     X_val_week = X_val_prep.drop(columns=week_cols_to_drop)
+    X_val_week = X_val_week.drop(columns=['Region_cluster'])
     for model_type in model_types:
         model = results_weekly[w]['models'][model_type]
         explainer = shap.TreeExplainer(model)
