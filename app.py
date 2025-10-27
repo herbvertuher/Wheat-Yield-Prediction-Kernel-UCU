@@ -10,7 +10,10 @@ import hdbscan
 from lightgbm import LGBMRegressor, Booster
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score, mean_pinball_loss
-import shap 
+
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # st.set_page_config(layout="wide")
 
@@ -513,7 +516,7 @@ with tabs[tab_idx]:
                 (df_predictions['Field_id'].isin(selected_fields) if selected_fields else True)
             ]
 
-            st.dataframe(filtered_df.style.format("{:.4f}", subset=['Actual', 'Predicted_Mean', 'Predicted_Lower', 'Predicted_Upper']), use_container_width=True, height=300)
+            st.dataframe(filtered_df.style.format("{:.4f}", subset=['Actual', 'Predicted_Mean', 'Predicted_Lower', 'Predicted_Upper']), height=300)
 
         show_predictions()
 
