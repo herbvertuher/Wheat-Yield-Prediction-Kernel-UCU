@@ -1,25 +1,85 @@
 from pathlib import Path
 import streamlit as st
 import json
+import joblib
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import hdbscan
+from lightgbm import LGBMRegressor, Booster
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score, mean_pinball_loss
+import shap 
 
 # st.set_page_config(layout="wide")
 
 root_path = Path(__file__).resolve().parents[0]
 
 artifacts_path = root_path / 'artifacts'
+models_path = root_path / 'artifacts' / 'models'
 plots_path = root_path / 'plots'
 metrics_path = root_path / 'metrics'
 confidence_intervals_path = plots_path / 'confidence_intervals'
 shap_path = plots_path / 'shap'
 
-train_coinfig = {}
-with open(artifacts_path / 'train_config.json', 'r', encoding='utf-8') as f:
-    train_coinfig = json.load(f)
+LOWER_QUANTILE = 0.05
+UPPER_QUANTILE = 0.95
 
+# Merge duplicated rows if delta in operations time is lower that `gap_in_days`
+def merge_close_dates(group: pd.DataFrame, gap_in_days=30) -> pd.DataFrame:
+    # Сортуємо всередині групи
+    group = group.sort_values('date_of_start').reset_index(drop=True)
+
+    merged_rows = []
+    current_start = group.loc[0, 'date_of_start']
+    current_total = group.loc[0, 'total']
+
+    for i in range(1, len(group)):
+        delta = (group.loc[i, 'date_of_start'] - group.loc[i-1, 'date_of_start']).days
+        if delta <= gap_in_days:
+            # Якщо дата близька – додаємо total
+            current_total += group.loc[i, 'total']
+        else:
+            # Закриваємо попередній блок
+            merged_rows.append({
+                'date_of_start': current_start,
+                'total': current_total
+            })
+            # Починаємо новий блок
+            current_start = group.loc[i, 'date_of_start']
+            current_total = group.loc[i, 'total']
+
+    # Додаємо останній блок
+    merged_rows.append({
+        'date_of_start': current_start,
+        'total': current_total
+    })
+
+    return pd.DataFrame(merged_rows)
+
+
+
+# Load configs and artifacts
+train_config = {}
+with open(artifacts_path / 'train_config.json', 'r', encoding='utf-8') as f:
+    train_config = json.load(f)
+weeks = train_config['pred_weeks_range']
+
+lgbm_models = {}
+for w in weeks:
+    lgbm_models[w] = {
+        'mean': Booster(model_file=models_path / f'model_mean_week_{w}.txt'),
+        'lower': Booster(model_file=models_path / f'model_lower_week_{w}.txt'),
+        'upper': Booster(model_file=models_path / f'model_upper_week_{w}.txt')
+    }
+
+embedding_model = SentenceTransformer(train_config['embedding_model_name'], trust_remote_code=True)
+umap_reducer = joblib.load(artifacts_path / 'umap_embeddings_reducer.pkl')
+hdbscan_clusterer = joblib.load(artifacts_path / 'hdbscan_embeddings_clusterer.pkl')
+
+
+# Load images
 image_paths = {
     'Distribution_number_of_operations': plots_path / 'Distribution_number_of_operations.png',
     'Dendrogram': plots_path / 'Dendrogram_visualization.png',
@@ -32,17 +92,18 @@ image_paths = {
     'Models_Lower_and_Upper_accuracy_CV': plots_path / 'Models_Lower_and_Upper_accuracy_CV.png',
 }
 
+# Load metrics
 df_cv_metrics = pd.read_pickle(metrics_path / 'df_cv_metrics.pkl')
 df_val_metrics = pd.read_pickle(metrics_path / 'df_val_metrics.pkl')
 
 
-
-# Створення вкладок (tabs) для організації
+# Define tabs
 tabs = st.tabs(['Task Description', 'Exploratory Data Analysis', 'Training', 'Validation', 'Forecasting'])
 tab_idx = 0
 
-with tabs[tab_idx]:  # Або назвіть відповідну вкладку
+with tabs[tab_idx]:
 
+    # === Task Description ===
     st.markdown("""
     ### Background
     `Yield prediction` stands as a critical challenge in agricultural, particularly for winter wheat, where early and accurate forecasts are essential. These predictions allow for improved planning in agribusiness operations, logistics, and trading activities. By combining weather observations, satellite indices like NDVI, and farm-level operational data, modern methods enhance accuracy and provide valuable insights into the factors influencing productivity. `Solving this problem` not only boosts efficiency in resource allocation and decision-making but also leads to optimized harvests, reduced risks, and better economic outcomes for stakeholders.
@@ -242,7 +303,7 @@ with tabs[tab_idx]:
     - Trained models using the above CV function on the training data.
     - Stored models and CV metrics in variable `results_weekly`.
 
-    I visualized CV MAE and MAPE for the mean model across weeks using a dual-axis plot (saved as `'Model_Mean_accuracy_CV.png'`), showing how accuracy improves as more data becomes available closer to harvest.
+    I visualized metrics for the models across weeks using a dual-axis plots, showing how accuracy improves as more data becomes available closer to harvest.
     """)
 
     col1, col2 = st.columns(2)
@@ -302,42 +363,160 @@ with tabs[tab_idx]:
     To identify influential features, I computed `SHAP` values for each model type (`mean`, `lower`, `upper`) per week using `TreeExplainer` on the validation set.
     """)
 
-    st.subheader('Select week:')
-    week_options = train_coinfig['pred_weeks_range']
-    selected_week = st.pills('Select week:', week_options, selection_mode='single', label_visibility='hidden', default=week_options[0])
-    
-    st.subheader('SHAP values for `Lower`, `Mean` and `Upper` models:')
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.image(shap_path / f'lower_week_{selected_week}.png')
-    with col2:
-        st.image(shap_path / f'mean_week_{selected_week}.png')
-    with col3:
-        st.image(shap_path / f'upper_week_{selected_week}.png')
+    @st.fragment
+    def plot_shap_and_ci():
+        st.subheader('Select week:')
+        selected_week = st.pills('Select week:', weeks, selection_mode='single', label_visibility='hidden', default=weeks[0])
+        
+        st.subheader('SHAP values for `Lower`, `Mean` and `Upper` models:')
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.image(shap_path / f'lower_week_{selected_week}.png')
+        with col2:
+            st.image(shap_path / f'mean_week_{selected_week}.png')
+        with col3:
+            st.image(shap_path / f'upper_week_{selected_week}.png')
 
-    st.subheader('Forecasts with 5% and 95% confidence intervals:')
-    st.image(confidence_intervals_path / f'week_{selected_week}.png')
+        st.subheader('Forecasts with 5% and 95% confidence intervals:')
+        st.image(confidence_intervals_path / f'week_{selected_week}.png')
+
+    plot_shap_and_ci()
 
     tab_idx += 1
 
 with tabs[tab_idx]:
-
-    import pandas as pd
-    from lightgbm import LGBMRegressor
-    import shap 
 
     st.markdown("""
     Upload new data (similar to the training data format, e.g., parquet with features like weather, NDVI, operations) for yield prediction.
     The files will be preprocessed through the pipeline (cleaning, embeddings, clustering), and predictions will be made using the trained models for a selected week.
     """)
 
-    uploaded_main_file = st.file_uploader("Upload new main file", type=['parquet'])
-    uploaded_weather_file = st.file_uploader("Upload new operations file", type=['parquet'])
+    uploaded_main_file = st.file_uploader("Upload main file", type=['parquet'])
+    uploaded_weather_file = st.file_uploader("Upload operations file", type=['parquet'])
 
     if (uploaded_main_file is not None) and (uploaded_weather_file is not None):
         df_main = pd.read_parquet(uploaded_main_file)
         df_operations = pd.read_parquet(uploaded_weather_file)
         st.success("Files uploaded successfully!")
+
+        # Process `df_main`
+        allowed_nan = ['N', 'P', 'K']
+        cols_check = [c for c in df_main.columns if c not in allowed_nan]
+        df_main = df_main.dropna(subset=cols_check)
+
+        # Process `df_operations`
+        df_operations.columns = ['operation', 'detailed_operation', 'year_of_start', 'date_of_start', 'total', 'field_id']
+        df_operations['date_of_start'] = pd.to_datetime(df_operations['date_of_start'])
+        
+        operation_column = 'detailed_operation'
+        group_cols = ['field_id', 'operation', 'detailed_operation']
+        df_operations_merged = (
+            df_operations
+            .groupby(group_cols, group_keys=True)
+            .apply(merge_close_dates)
+            .reset_index().drop(columns=['level_3']))
+        df_operations_merged[operation_column] = df_operations_merged[operation_column].str.replace('.', '')
+        df_operations_merged_rows = df_operations_merged.groupby('field_id', as_index=False)[operation_column].apply(lambda x: '. '.join(x))
+        sentences = df_operations_merged_rows[operation_column].to_list()
+        embeddings = embedding_model.encode(sentences, normalize_embeddings=True)
+        embeddings_reduced = umap_reducer.transform(embeddings)
+        labels, _strengths = hdbscan.approximate_predict(hdbscan_clusterer, embeddings_reduced)        
+        df_embeddings_labels = pd.DataFrame(data=labels,
+                                    index=df_operations_merged_rows['field_id'],
+                                    columns=['HDBSCAN_operation_cluster']
+                                    ).reset_index(drop=False)
+        df_embeddings_labels['HDBSCAN_operation_cluster'] = \
+                df_embeddings_labels['HDBSCAN_operation_cluster'].astype('category')
+        
+        # Merge `main` and `operations` DataFrames
+        df_main_prep = (df_main
+                        .merge(df_embeddings_labels, left_on='Field_id', right_on='field_id')
+                        .drop(columns=['Field_id'])
+                        .set_index('field_id'))
+        
+        X_prep = df_main_prep.loc[:, train_config['features']]
+        y_true = df_main_prep['Yield']
+
+
+        # Створення таблиці з метриками на валідаційній вибірці та збереження прогнозів
+        metrics = []
+        y_preds_weekly = {k: {} for k in weeks}
+        for w in weeks:
+            week_cols_to_drop = X_prep.columns[X_prep.columns.str.extract(r'(\d+)$')[0].astype(float) > w]
+            X_prep_week = X_prep.drop(columns=week_cols_to_drop)
+            row = {}
+            for model_type in ['mean', 'lower', 'upper']:
+                model = lgbm_models[w][model_type]
+                y_pred = model.predict(X_prep_week)
+                y_preds_weekly[w][model_type] = y_pred  # Збереження прогнозів для візуалізації
+                if model_type == 'mean':
+                    row[f'mae_{model_type}'] = np.round(mean_absolute_error(y_true, y_pred), 4)
+                    row[f'mape_{model_type}'] = np.round(mean_absolute_percentage_error(y_true, y_pred), 4)
+                    row[f'r2_{model_type}'] = np.round(r2_score(y_true, y_pred), 4)
+                else:
+                    current_quantile = LOWER_QUANTILE if model_type == 'lower' else UPPER_QUANTILE
+                    row[f'pinball_{model_type}'] = np.round(mean_pinball_loss(y_true, y_pred, alpha=current_quantile), 4)
+                
+            metrics.append(row)
+
+        df_metrics = pd.DataFrame(metrics, index=weeks)
+        
+        st.subheader('Computed metrics:')
+        st.table(df_metrics)
+
+
+        st.subheader('Forecasts with 5% and 95% confidence intervals:')
+
+        for w in y_preds_weekly.keys():
+            df_to_plot = pd.concat([y_true.reset_index(drop=False), pd.DataFrame(y_preds_weekly[w])], axis=1).set_index(['field_id'])
+            df_to_plot = df_to_plot.sort_values(['Yield'])
+            df = df_to_plot.copy()
+
+            x = df.index.astype(str)
+            fig, ax = plt.subplots(figsize=(20, 6), dpi=300)
+            ax.plot(x, df['Yield'], color='green', marker='*', linestyle='', alpha=0.5, label='Actual value')
+            ax.plot(x, df['mean'], color='blue', marker='*', linestyle='', alpha=0.5, label='Predicted value')
+            ax.plot(x, df['lower'], color='purple', marker='', linestyle='--', label='Lower bound')
+            ax.plot(x, df['upper'], color='brown', marker='', linestyle='--', label='Upper bound')
+            ax.set_xlabel('Field ID')
+            ax.set_ylabel('Yield (t/ha)')
+            ax.tick_params(axis='x', rotation=90)
+            ax.set_title(f'Visualization of forecasts for week `{w}` with confidence intervals of 5% and 95%')
+            ax.legend()
+            ax.grid(alpha=0.3)
+            st.pyplot(fig)
+
+        @st.fragment
+        def show_predictions():
+            # Create combined predictions DF for filtering
+            data = []
+            for w in weeks:
+                df_week = pd.DataFrame({
+                    'Week': w,
+                    'Field_id': y_true.index,
+                    'Actual': y_true.values,
+                    'Predicted_Mean': y_preds_weekly[w]['mean'],
+                    'Predicted_Lower': y_preds_weekly[w]['lower'],
+                    'Predicted_Upper': y_preds_weekly[w]['upper']
+                })
+                data.append(df_week)
+
+            df_predictions = pd.concat(data, ignore_index=True)
+
+            # Filters for table
+            st.subheader("Predictions Table:")
+            selected_weeks = st.pills('Filter by Week(s):', weeks, selection_mode='multi', default=weeks)
+            selected_fields = st.multiselect("Filter by Field_id(s):", sorted(df_predictions['Field_id'].unique()), default=[])
+
+            filtered_df = df_predictions[
+                (df_predictions['Week'].isin(selected_weeks)) &
+                (df_predictions['Field_id'].isin(selected_fields) if selected_fields else True)
+            ]
+
+            st.dataframe(filtered_df.style.format("{:.4f}", subset=['Actual', 'Predicted_Mean', 'Predicted_Lower', 'Predicted_Upper']), use_container_width=True, height=300)
+
+        show_predictions()
+
     else:
         st.info("Please upload files to make predictions.")
 
