@@ -1,0 +1,1 @@
+conda activate yield-ucu & streamlit run app.py
