@@ -94,9 +94,9 @@ df_main = df_main.drop(columns=cols_to_drop)
 df_operations.columns = ['operation', 'detailed_operation', 'year_of_start', 'date_of_start', 'total', 'field_id']
 df_operations['date_of_start'] = pd.to_datetime(df_operations['date_of_start'])
 
-# operation_column = 'operation' 
+operation_column = 'operation'
 # ===== \\\ OR //// =====
-operation_column = 'detailed_operation'
+# operation_column = 'detailed_operation'
 
 # %%
 
@@ -148,7 +148,7 @@ df_operations_merged_rows = df_operations_merged.groupby('field_id', as_index=Fa
 # %%
 
 # Обчислюємо кількість операцій у кожному рядку
-operation_counts = df_operations_merged_rows['detailed_operation'].apply(lambda row: len(row.split('.')))
+operation_counts = df_operations_merged_rows[operation_column].apply(lambda row: len(row.split('.')))
 # Підраховуємо частоти
 count_series = operation_counts.value_counts().sort_index()
 # Перетворюємо у відсотки
@@ -437,6 +437,13 @@ y = df_main_prepared['Yield']
 # %%
 
 X_trn, X_val, y_trn, y_val = train_test_split(X, y, test_size=0.15, stratify=X['Region_cluster'], random_state=GLOBAL_RANDOM_SEED)
+
+# Alternative way to train test split
+# smallest_cluster = X['Region_cluster'].value_counts().idxmin()
+# mask = X['Region_cluster'] == smallest_cluster
+
+# X_trn, y_trn = X[mask], y[mask]
+# X_val, y_val = X[~mask], y[~mask]
 
 # %%
 
