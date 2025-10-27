@@ -3,6 +3,7 @@
 from pathlib import Path
 import re
 import json
+import joblib
 import pandas as pd
 import numpy as np
 import seaborn as sns
@@ -42,16 +43,24 @@ root_path = Path(__file__).resolve().parents[0]
 
 data_path = root_path / 'data'
 artifacts_path = root_path / 'artifacts'
+models_path = root_path / 'artifacts' / 'models'
 plots_path = root_path / 'plots'
 metrics_path = root_path / 'metrics'
 confidence_intervals_path = plots_path / 'confidence_intervals'
 shap_path = plots_path / 'shap'
 
-for directory in [artifacts_path, plots_path, metrics_path, confidence_intervals_path, shap_path]:
+for directory in [artifacts_path, models_path, plots_path, metrics_path, confidence_intervals_path, shap_path]:
     directory.mkdir(parents=True, exist_ok=True)
 
 df_main = pd.read_parquet(data_path / 'df_2025_v2_extended_weather.parquet')
 df_operations = pd.read_parquet(data_path / 'operations_2025.parquet')
+
+# Create sample for Streamlit Forecasting
+sample_field_ids = [2, 7, 68, 40, 111, 17]
+df_main_sample = df_main[df_main['Field_id'].isin(sample_field_ids)]
+df_operations_sample = df_operations[df_operations['Field_id'].isin(sample_field_ids)]
+df_main_sample.to_parquet(data_path / 'df_main_sample.parquet')
+df_operations_sample.to_parquet(data_path / 'df_operations_sample.parquet')
 
 # initial preparation `main` dataframe
 df_main = df_main[df_main['Culture'].notna()]
@@ -92,11 +101,7 @@ operation_column = 'detailed_operation'
 # %%
 
 # Merge duplicated rows if delta in operations time is lower that `gap_in_days`
-gap_in_days = 30
-# Список текстових колонок для групування
-group_cols = ['field_id', 'operation', 'detailed_operation']
-
-def merge_close_dates(group: pd.DataFrame) -> pd.DataFrame:
+def merge_close_dates(group: pd.DataFrame, gap_in_days=30) -> pd.DataFrame:
     # Сортуємо всередині групи
     group = group.sort_values('date_of_start').reset_index(drop=True)
 
@@ -127,6 +132,9 @@ def merge_close_dates(group: pd.DataFrame) -> pd.DataFrame:
 
     return pd.DataFrame(merged_rows)
 
+# Список текстових колонок для групування
+group_cols = ['field_id', 'operation', 'detailed_operation']
+
 # Застосовуємо до всіх груп
 df_operations_merged = (
     df_operations
@@ -135,7 +143,6 @@ df_operations_merged = (
     .reset_index().drop(columns=['level_3'])
 )
 df_operations_merged[operation_column] = df_operations_merged[operation_column].str.replace('.', '')
-
 df_operations_merged_rows = df_operations_merged.groupby('field_id', as_index=False)[operation_column].apply(lambda x: '. '.join(x))
 
 # %%
@@ -168,10 +175,9 @@ embedding_models = [
 ]
 selected_embedding_model_name = embedding_models[0]
 
-sentences_to_embeddings = df_operations_merged_rows[operation_column].to_list()
-
-model = SentenceTransformer(selected_embedding_model_name, trust_remote_code=True)
-embeddings = model.encode(sentences_to_embeddings, normalize_embeddings=True)
+sentences = df_operations_merged_rows[operation_column].to_list()
+embedding_model = SentenceTransformer(selected_embedding_model_name, trust_remote_code=True)
+embeddings = embedding_model.encode(sentences, normalize_embeddings=True)
 
 df_embeddings = pd.DataFrame(data=embeddings,
                              index=df_operations_merged_rows['field_id'],
@@ -261,10 +267,12 @@ hdbscan_params = {
 # Зменшення розмірності з UMAP (для кластеризації)
 umap_reducer = umap.UMAP(**umap_params)
 embeddings_reduced = umap_reducer.fit_transform(embeddings)
+joblib.dump(umap_reducer, artifacts_path / 'umap_embeddings_reducer.pkl')
 
 # Кластеризація з HDBSCAN
 clusterer = hdbscan.HDBSCAN(**hdbscan_params)
 labels = clusterer.fit_predict(embeddings_reduced)
+joblib.dump(clusterer, artifacts_path / 'hdbscan_embeddings_clusterer.pkl')
 
 # Кількість кластерів (ігноруючи шум -1)
 n_clusters = len(np.unique(labels)) - (1 if -1 in labels else 0)
@@ -517,6 +525,10 @@ def train_lgbm_with_cv(X, y, stratify_col_name, params, n_splits=5):
     # Train models for all data without CV
     model_mean, model_lower, model_upper = init_and_fit_models(X, y, cv_mode=False)
 
+    model_mean.booster_.save_model(models_path / f'model_mean_week_{w}.txt')
+    model_lower.booster_.save_model(models_path / f'model_lower_week_{w}.txt')
+    model_upper.booster_.save_model(models_path / f'model_upper_week_{w}.txt')
+
     # Summarize metrics for `mean` model
     mean_mae_cv = np.round(np.mean(mae_mean), 4)
     mean_mape_cv = np.round(np.mean(mape_mean), 4)
@@ -677,7 +689,7 @@ for w in y_val_preds_weekly.keys():
     plt.xlabel('Field ID')
     plt.ylabel('Yield (t/ha)')
     plt.xticks(rotation=90)
-    plt.title(f'Visualization of forecasts for {w} weeks with confidence intervals of 5% and 95%')
+    plt.title(f'Visualization of forecasts for week `{w}` with confidence intervals of 5% and 95%')
     plt.legend()
     plt.grid(alpha=0.3)
     plt.savefig(confidence_intervals_path / f'week_{w}.png', dpi=300)
