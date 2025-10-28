@@ -1,5 +1,6 @@
 {
     "random_seed": 42,
+    "operation_column": "operation",
     "embedding_model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "features": [
         "ndvi_mean_9",

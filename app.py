@@ -411,7 +411,7 @@ with tabs[tab_idx]:
         df_operations.columns = ['operation', 'detailed_operation', 'year_of_start', 'date_of_start', 'total', 'field_id']
         df_operations['date_of_start'] = pd.to_datetime(df_operations['date_of_start'])
         
-        operation_column = 'detailed_operation'
+        operation_column = train_config['operation_column']
         group_cols = ['field_id', 'operation', 'detailed_operation']
         df_operations_merged = (
             df_operations

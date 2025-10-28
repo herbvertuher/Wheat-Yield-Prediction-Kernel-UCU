@@ -736,6 +736,7 @@ for w in results_weekly.keys():
 # Save train_coinfig.json
 train_coinfig = {
     'random_seed': GLOBAL_RANDOM_SEED,
+    'operation_column': operation_column,
     'embedding_model_name': selected_embedding_model_name,
     'features': X.drop(columns=[stratify_col_name]).columns.to_list(),
     'pred_weeks_range': list(range(START_WEEK, END_WEEK+1))
